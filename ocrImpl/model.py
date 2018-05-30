@@ -31,9 +31,154 @@ from keras.utils.data_utils import get_file
 from keras.preprocessing import image
 import keras.callbacks
 import cv2
-import ocrImpl.TextImageGenerator as TextImageGenerator
+# import ocrImpl.TextImageGenerator as TextImageGenerator
+import os
+from os.path import join
+import json
+from collections import Counter
+
+sess = tf.Session()
+K.set_session(sess)
+def get_counter(dirpath, tag):
+    dirname = os.path.basename(dirpath)
+    ann_dirpath = join(dirpath, 'ann')
+    letters = ''
+    lens = []
+    for filename in os.listdir(ann_dirpath):
+        json_filepath = join(ann_dirpath, filename)
+        ann = json.load(open(json_filepath, 'r'))
+        tags = ann['tags']
+        if tag in tags:
+            description = ann['description']
+            lens.append(len(description))
+            letters += description
+    print('Max plate length in "%s":' % dirname, max(Counter(lens).keys()))
+    return Counter(letters)
 
 
+
+def labels_to_text(labels):
+    return ''.join(list(map(lambda x: letters[int(x)], labels)))
+
+def text_to_labels(text):
+    return list(map(lambda x: letters.index(x), text))
+
+def is_valid_str(s):
+    for ch in s:
+        if not ch in letters:
+            return False
+    return True
+
+c_val = get_counter('d:/git/supervisely-tutorials/ocrImpl/data/anpr_ocr__train', 'val')
+c_train = get_counter('d:/git/supervisely-tutorials/ocrImpl/data/anpr_ocr__train', 'train')
+letters_train = set(c_train.keys())
+letters_val = set(c_val.keys())
+if letters_train == letters_val:
+    print('Letters in train and val do match')
+else:
+    raise Exception()
+# print(len(letters_train), len(letters_val), len(letters_val | letters_train))
+letters = sorted(list(letters_train))
+print('Letters:', ' '.join(letters))
+
+
+
+
+
+
+class TextImageGenerator:
+    def __init__(self,
+                 dirpath,
+                 tag,
+                 img_w, img_h,
+                 batch_size,
+                 downsample_factor,
+                 max_text_len=8):
+
+        self.img_h = img_h
+        self.img_w = img_w
+        self.batch_size = batch_size
+        self.max_text_len = max_text_len
+        self.downsample_factor = downsample_factor
+
+        img_dirpath = join(dirpath, 'img')
+        ann_dirpath = join(dirpath, 'ann')
+        self.samples = []
+        for filename in os.listdir(img_dirpath):
+            name, ext = os.path.splitext(filename)
+            if ext in ['.png', '.jpg']:
+                img_filepath = join(img_dirpath, filename)
+                json_filepath = join(ann_dirpath, name + '.json')
+                ann = json.load(open(json_filepath, 'r'))
+                description = ann['description']
+                tags = ann['tags']
+                if tag not in tags:
+                    continue
+                if is_valid_str(description):
+                    self.samples.append([img_filepath, description])
+
+        self.n = len(self.samples)
+        self.indexes = list(range(self.n))
+        self.cur_index = 0
+
+    def build_data(self):
+        self.imgs = np.zeros((self.n, self.img_h, self.img_w))
+        self.texts = []
+        for i, (img_filepath, text) in enumerate(self.samples):
+            img = cv2.imread(img_filepath)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            img = cv2.resize(img, (self.img_w, self.img_h))
+            img = img.astype(np.float32)
+            img /= 255
+            # width and height are backwards from typical Keras convention
+            # because width is the time dimension when it gets fed into the RNN
+            self.imgs[i, :, :] = img
+            self.texts.append(text)
+
+    def get_output_size(self):
+        return len(letters) + 1
+
+    def next_sample(self):
+        self.cur_index += 1
+        if self.cur_index >= self.n:
+            self.cur_index = 0
+            random.shuffle(self.indexes)
+        return self.imgs[self.indexes[self.cur_index]], self.texts[self.indexes[self.cur_index]]
+
+    def next_batch(self):
+        while True:
+            # width and height are backwards from typical Keras convention
+            # because width is the time dimension when it gets fed into the RNN
+            if K.image_data_format() == 'channels_first':
+                X_data = np.ones([self.batch_size, 1, self.img_w, self.img_h])
+            else:
+                X_data = np.ones([self.batch_size, self.img_w, self.img_h, 1])
+            Y_data = np.ones([self.batch_size, self.max_text_len])
+            input_length = np.ones((self.batch_size, 1)) * (self.img_w // self.downsample_factor - 2)
+            label_length = np.zeros((self.batch_size, 1))
+            source_str = []
+
+            for i in range(self.batch_size):
+                img, text = self.next_sample()
+                img = img.T
+                if K.image_data_format() == 'channels_first':
+                    img = np.expand_dims(img, 0)
+                else:
+                    img = np.expand_dims(img, -1)
+                X_data[i] = img
+                Y_data[i] = text_to_labels(text)
+                source_str.append(text)
+                label_length[i] = len(text)
+
+            inputs = {
+                'the_input': X_data,
+                'the_labels': Y_data,
+                'input_length': input_length,
+                'label_length': label_length,
+                # 'source_str': source_str
+            }
+            outputs = {'ctc': np.zeros([self.batch_size])}
+            yield (inputs, outputs)
 
 
 
@@ -79,9 +224,9 @@ def train(img_w, load=False):
 
     batch_size = 32
     downsample_factor = pool_size ** 2
-    tiger_train = TextImageGenerator('/data/anpr_ocr__train', 'train', img_w, img_h, batch_size, downsample_factor)
+    tiger_train = TextImageGenerator('d:/git/supervisely-tutorials/ocrImpl/data/anpr_ocr__train', 'train', img_w, img_h, batch_size, downsample_factor)
     tiger_train.build_data()
-    tiger_val = TextImageGenerator('/data/anpr_ocr__train', 'val', img_w, img_h, batch_size, downsample_factor)
+    tiger_val = TextImageGenerator('d:/git/supervisely-tutorials/ocrImpl/data/anpr_ocr__train', 'val', img_w, img_h, batch_size, downsample_factor)
     tiger_val.build_data()
 
     act = 'relu'
@@ -146,3 +291,65 @@ def train(img_w, load=False):
                             validation_steps=tiger_val.n)
 
     return model
+
+model = train(128, load=False)
+print()
+
+
+# For a real OCR application, this should be beam search with a dictionary
+# and language model.  For this example, best path is sufficient.
+
+def decode_batch(out):
+    ret = []
+    for j in range(out.shape[0]):
+        out_best = list(np.argmax(out[j, 2:], 1))
+        out_best = [k for k, g in itertools.groupby(out_best)]
+        outstr = ''
+        for c in out_best:
+            if c < len(letters):
+                outstr += letters[c]
+        ret.append(outstr)
+    return ret
+
+
+tiger_test = TextImageGenerator('d:/git/supervisely-tutorials/ocrImpl/data/anpr_ocr__test', 'test', 128, 64, 8, 4)
+tiger_test.build_data()
+
+net_inp = model.get_layer(name='the_input').input
+net_out = model.get_layer(name='softmax').output
+
+for inp_value, _ in tiger_test.next_batch():
+    bs = inp_value['the_input'].shape[0]
+    X_data = inp_value['the_input']
+    net_out_value = sess.run(net_out, feed_dict={net_inp: X_data})
+    pred_texts = decode_batch(net_out_value)
+    labels = inp_value['the_labels']
+    texts = []
+    for label in labels:
+        text = ''.join(list(map(lambda x: letters[int(x)], label)))
+        texts.append(text)
+
+    for i in range(bs):
+        fig = plt.figure(figsize=(10, 10))
+        outer = gridspec.GridSpec(2, 1, wspace=10, hspace=0.1)
+        ax1 = plt.Subplot(fig, outer[0])
+        fig.add_subplot(ax1)
+        ax2 = plt.Subplot(fig, outer[1])
+        fig.add_subplot(ax2)
+        print('Predicted: %s\nTrue: %s' % (pred_texts[i], texts[i]))
+        img = X_data[i][:, :, 0].T
+        ax1.set_title('Input img')
+        ax1.imshow(img, cmap='gray')
+        ax1.set_xticks([])
+        ax1.set_yticks([])
+        ax2.set_title('Activations')
+        ax2.imshow(net_out_value[i].T, cmap='binary', interpolation='nearest')
+        ax2.set_yticks(list(range(len(letters) + 1)))
+        ax2.set_yticklabels(letters + ['blank'])
+        ax2.grid(False)
+        for h in np.arange(-0.5, len(letters) + 1 + 0.5, 1):
+            ax2.axhline(h, linestyle='-', color='k', alpha=0.5, linewidth=1)
+
+        # ax.axvline(x, linestyle='--', color='k')
+        plt.show()
+    break
